@@ -1,0 +1,231 @@
+---
+title: "Car value prediction"
+author: "Ltaief Mohamed"
+date: "5/14/2021"
+output: 
+  pdf_document: 
+    toc: yes
+    number_sections: yes
+    fig_width: 10
+---
+
+```{r setup, include=FALSE}
+if(!require(knitr)) install.packages("knitr")
+if(!require(tidyverse)) install.packages("tidyverse")
+if(!require(lubridate)) install.packages("lubridate")
+if(!require(caret)) install.packages("caret")
+if(!require(gridExtra)) install.packages("gridExtra")
+if(!require(rpart)) install.packages("rpart")
+library(tidyverse)
+library(caret)
+library(lubridate)
+library(gridExtra)
+library(rpart)
+library(knitr)
+
+opts_chunk$set(echo = F, cache=TRUE, error=FALSE, message=FALSE,  warning=FALSE)
+```
+\newpage
+# Introduction
+The automotive industry is one of the largest industries by revenue . It is regarded as one of the most competitive and innovative in the world. That being the  case, a good understanding of the market is a necessary task for business and consumers and a price forecasting model can be of values for both parties. 
+
+# Project objective
+We will be creating a car price predictor using machine learning methods based on  data from one of the largest Europe's car market.
+Our report will showcase two methods we selected to execute our task: Using a matrix factorization and regression trees. 
+
+### RMSE:
+To describe the behavior of our price outcome, our approach is to define the loss function. A function that quantifies the deviation of the observed outcome from the prediction (residual).
+In our case we used the root square error(RMSE) known as the standard deviation of the residuals. It has the same units as the measured and calculated data. Smaller values indicate a better performance of our system.
+$$RMSE =\sqrt(\sum_{i=1}^{n} (X~observation,i~-X~model,i~)^2)$$
+
+# Exploratory data analysis
+
+## Features and processing
+
+### The dataset
+```{r}
+gc<-read.csv("https://raw.githubusercontent.com/Ltaiefgit/car_price/main/autoscout24-germany-dataset.csv")
+```
+
+We are using a [_**Kaggle**_](https://www.kaggle.com/ander289386/cars-germany) dataset of 46376 cars collected between 2011 and 2021 and scraped from the autoscout24 [_**website**_](https://autoscout24.com) an online marketplace for purchase and sale of different type of vehicles. 
+
+Our data lists some of the car features:  
+mileage, make, model, fuel, gear, Offer type, Horse power (hp), year and the price.
+```{r}
+str(gc)
+```
+
+### Data wrangling:
+Before moving on to algorithm implementation, there is some data wrangling to take into account. 
+In order to simplify the computation process we are going to convert some features units:
+*  The year column will be transformed in age in years.
+*  Since we are working with car data in german market we can normalize the mileage metric accordingly. As reported by the Odyssee-mure [_**website**_](https://www.odyssee-mure.eu/publications/efficiency-by-sector/transport/distance-travelled-by-car.html) the average distance traveled in germany since 2011 is around 14000 Km/year. Given this information we can define a new metric "mileage ratio" that describes whether the car has been used more than the average as follows:
+$$mileage ratio = mileage / 14000 - age$$ 
+This gives us a qualitative description of the mileage metric.
+```{r}
+##Delete rows with missing value
+gc<-gc%>%filter(is.na(hp)!=T&model!=""&gear!="")
+#the age of the vehicle in years
+gc<-gc%>%mutate(car_age=2021-year)%>%select(-year)
+###mileage ratio depending on the average german car mileage
+gc<-gc%>%mutate(mileage_ratio=mileage/14000-car_age)
+```
+
+We deliberately removed the far outliers according to Tukey definition. That is to say consider the prices between the 75th percentile (top whisker of the boxplot) plus 3 * the interquantile range (IQR) and the 25th percentile (bottom whisker of the boxplot) minus 3 * IQR. An outlier is anything outside this range. 
+```{r}
+gc<-gc%>%group_by(make)%>%mutate(iqr=IQR(price),min=quantile(price, .25)-3*iqr,max=quantile(price, .75)+3*iqr)%>%filter(price>min&price<max)
+```
+
+### Data exploration:
+
+```{r}
+set.seed(1)
+test_index<- createDataPartition(y = gc$price, times = 1, p = 0.1, list = FALSE)
+train_set<- gc[-test_index,]
+temp <- gc[test_index,]
+test_set<- train_set%>%semi_join(temp, by="make")%>%semi_join(temp, by="model")
+removed <- anti_join(temp, test_set)
+train_set <- rbind(train_set, removed)
+rm(test_index, temp,removed)
+```
+
+After removing all missing data and partitioning our data into two datasets for testing purposes lets take a look at the distribution of our price according to the different features.
+
+#### Mileage :
+
+As we can see here the prices are relatively low for the cars with higher mileage (figure 1.a).
+The cars that haven't been used much have more value than the more driven ones as the cost of maintenance and servicing gets higher with wear and tear. If ye look at the cars that have a mileage ratio close to 0 (a car that it normally driven according to the german market) the prices seem to be higher. 
+(figure 1.b)  
+```{r}
+##########mileage ratio
+mileage<-gc%>%ggplot(aes(mileage,price))+
+  geom_point()+
+  xlab("a) mileage")
+mileage_ratio<-gc%>%filter(mileage!=0)%>%ggplot(aes(mileage_ratio,price))+
+  geom_point()+
+  xlab("b) mileage ratio")
+grid.arrange(mileage,mileage_ratio, ncol=2)
+```  
+
+#### Horse power:
+
+People love a powerful vehicle. When it comes to horse power, price increase dramatically for cars with a better performance on the road. It is one of the main features that attracts buyers attention.
+
+```{r}
+##horsepower
+gc%>%ggplot(aes(hp, price))+
+  geom_point()+
+  geom_smooth()
+```  
+
+#### Make:
+
+When it comes to car prices, some clearly exceed others by far. In fact some are considered as luxuary items. The Maybach for example has a minimum price of 500 thousand euros. On the other hand, a Citroen has a minimum value of 1100 euros.    
+```{r}
+gc%>%ggplot(aes(price,make))+
+  geom_boxplot()
+```
+
+
+# Model selection:
+
+## Matrix factorization:
+In the course of our project we adopted a matrix factorization method to construct the first version of our algorithm.
+We assume the price y is the same to all entries with the difference explained by random variations (bias). Thereby the goal is to minimize the residual $\epsilon$ for each observation k with b the biases total. $$\epsilon~k~=y~k~-b~k~$$
+Given that the average of all rating as a value of $\mu$ minimize the residual $\epsilon$ we will start by identifying the first element of our formula $\hat y~k~$.
+The idea is to work with the average price $y~k~$ and gradually add the different biases caused by the main features.
+The default model performance (without considering the bias) is characterized by the following RMSE:
+```{r}
+##average car price
+mu_hat<-mean(train_set$price)
+RMSE_average<-RMSE(mu_hat,test_set$price)
+RMSE_average
+```
+Based on these observations we are building our model characterized by:  
+* car model  
+* make   
+* horse power  
+* mileage ratio
+
+Our method is analytically described by the formula:  
+$$ Y~i,u,t~=\hat\mu+\hat b~m~+\hat b~h~+\hat b~r~+\hat b~f~+\epsilon $$
+where  
+** $\hat b~o~$ is a make  effect   
+** $\hat b~h~$ is a horse power effect
+** $\hat b~r~$ is a mileage ratio effect 
+** $\hat b~f~$ is a fuel effect 
+penalized with the independent error $\epsilon$
+
+```{r,}
+#####matrix factorization algorithm
+#average car price
+mu_hat<-mean(train_set$price)
+#Price prediction according to:
+#make
+average_p_make<-train_set%>%group_by(make)%>%summarise(b_m=mean(price-mu_hat))
+prediction_make<- mu_hat+test_set%>%left_join(average_p_make, by="make")%>%pull(b_m)
+RMSE(prediction_make,test_set$price)
+#horsepower+make
+average_mmhp<-train_set%>%left_join(average_p_make, by="make")%>%group_by(hp)%>%summarise(b_h=mean(price-mu_hat-b_m))
+predicted_mmhp<-test_set%>%left_join(average_p_make, by="make")%>%left_join(average_mmhp, by="hp")%>%mutate(p=mu_hat+b_m+b_h)%>%pull(p)
+RMSE(predicted_mmhp,test_set$price)
+#car mileage_ratio+horsepower+make
+average_mmhpmr<- train_set%>%left_join(average_p_make, by="make")%>%left_join(average_mmhp, by = "hp")%>%group_by(mileage_ratio)%>%summarise(b_r=mean(price-mu_hat-b_m-b_h))
+prediction_mmhpmr<-test_set%>%left_join(average_p_make, by="make")%>%left_join(average_mmhp, by="hp")%>%left_join(average_mmhpmr, by="mileage_ratio")%>%mutate(p=mu_hat+b_m+b_h+b_r)%>%pull(p)
+RMSE(prediction_mmhpmr, test_set$price)
+#fuel+mileage_ratio+horsepower+make
+average_mmhpmrf<- train_set%>%left_join(average_p_make, by="make")%>%left_join(average_mmhp, by = "hp")%>%left_join(average_mmhpmr, by = "mileage_ratio")%>%group_by(fuel)%>%summarise(b_f=mean(price-mu_hat-b_m-b_h-b_r))
+prediction_mmhpmrf<-test_set%>%left_join(average_p_make, by="make")%>%left_join(average_mmhp, by="hp")%>%left_join(average_mmhpmr, by="mileage_ratio")%>%left_join(average_mmhpmrf, by = "fuel")%>%mutate(p=mu_hat+b_m+b_h+b_r+b_f)%>%pull(p)
+RMSE(prediction_mmhpmrf, test_set$price)
+final_rmse_mf<-RMSE(prediction_mmhpmrf, test_set$price)
+
+```
+
+
+## Regression tree:
+
+As a second version of our algorithm, we decided to pick the regression tree method. The idea is to build a decision tree, at the end of each node, obtain a predictor. 
+```{r}
+###rpart 
+train_rpart <- train(price ~ ., method = "rpart",tuneGrid = data.frame(cp = seq(0, 0.05, len = 25)),
+                     data =train_set)
+p_rp<-predict(train_rpart,test_set)
+rmse_tree<-rmse_rpart<-RMSE(p_rp, test_set$price)
+```
+By such a method our data is partitioned recursively into partitions for a number of times J in non overlapping regions R. 
+Each selected partition x is split to create new partitions, characterized by the predictor j and the value s. 
+Finally we obtain a number of predictors that we will act upon.
+We can select the complexity parameter by performing a cross validation that minimizes the root mean square error.
+
+```{r}
+ggplot(train_rpart)
+```
+
+# Results:
+In this section we are going to quantify the performance of our model by presenting the root mean square errors obtained by each method.
+
+```{r}
+tibble(method=c("Average","Matrix factorization","Regression tree"), RMSE=c(RMSE_average,final_rmse_mf,rmse_tree))%>%knitr::kable()
+```
+As illustrated in the results table, our regression tree has outperformed the matrix factorization model. 
+
+# Conclusions: 
+In order to have an idea on the car price behavior in one of the largest marketplaces, we performed two different machine learning algorithms. We did perform a prediction that has an RMSE of 2800 euros. 
+The regression tree model used in this report had the upper hand in computation facility and coding effort.
+However with the European Green Deal banning the Gas cars by 2035, the prices studied in this report may vary in the near future.
+The most important of future work is to expand the knowledge acquired during the execution of this project working on a new challenge .
+
+# References:
+
+<https://grouplens.org/datasets/movielens/>
+
+Trevor Hastie, Robert Tibshirani, Jerome Friedman.
+The elements of statistical learning, Data mining, inference and prediction. second edition.
+
+<https://leanpub.com/datasciencebook>
+
+<https://www.carbibles.com/>
+
+<https://www.odyssee-mure.eu/>
+
+<https://en.wikipedia.org/>
